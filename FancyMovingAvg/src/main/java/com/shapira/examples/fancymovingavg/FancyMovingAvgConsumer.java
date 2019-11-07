@@ -8,9 +8,13 @@ import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.consumer.OffsetCommitCallback;
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.errors.WakeupException;
+import org.apache.kafka.common.serialization.StringSerializer;
 
+import java.time.Duration;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
@@ -25,9 +29,11 @@ import java.util.Properties;
  * If you need all this fancy-schmancy stuff, you may just want to use KafkaStreams that handles it for you
  */
 public class FancyMovingAvgConsumer {
-    private Properties kafkaProps = new Properties();
+    private Properties consumerProps = new Properties();
+    private Properties producerProps = new Properties();
     private String waitTime;
     private KafkaConsumer<String, String> consumer;
+    private KafkaProducer<String, String> producer;
     private Map<TopicPartition, OffsetAndMetadata> currentOffsets = new HashMap<>();
 
     public static void main(String[] args) {
@@ -61,16 +67,17 @@ public class FancyMovingAvgConsumer {
             }
         });
 
-
         try {
             movingAvg.subscribe(Collections.singletonList(topic));
 
             // looping until ctrl-c, the shutdown hook will cleanup on exit
             while (true) {
-                ConsumerRecords<String, String> records = movingAvg.consumer.poll(10000);
+                ConsumerRecords<String, String> records = movingAvg.consumer.poll(Duration.ofSeconds(1));
+                movingAvg.producer.beginTransaction();
                 System.out.println(System.currentTimeMillis() + "  --  waiting for data...");
                 for (ConsumerRecord<String, String> record : records) {
-                    System.out.printf("offset = %d, key = %s, value = %s\n", record.offset(), record.key(), record.value());
+                    System.out.printf("offset = %d, key = %s, value = %s\n", record.offset(), record.key(),
+                            record.value());
 
                     int sum = 0;
 
@@ -86,18 +93,15 @@ public class FancyMovingAvgConsumer {
                     }
 
                     if (buffer.size() > 0) {
-                        System.out.println("Moving avg is: " + (sum / buffer.size()));
+                        int calcAvg = (sum / buffer.size());
+                        System.out.println("Moving avg is: " + calcAvg);
+                        ProducerRecord<String, String> avg = new ProducerRecord<>(topic+"-avg", null, Integer.toString(calcAvg));
+                        movingAvg.producer.send(avg);
                     }
                     movingAvg.currentOffsets.put(new TopicPartition(record.topic(), record.partition()), new OffsetAndMetadata(record.offset()+1, "no metadata"));
                 }
-                for (TopicPartition tp: movingAvg.consumer.assignment())
-                    System.out.println("Committing offset at position:" + movingAvg.currentOffsets);
-
-                movingAvg.consumer.commitAsync(movingAvg.currentOffsets,  (offsets, exception) -> {
-                    if (exception != null) {
-                        System.err.println("Failed to commit offsets: " + offsets + "; " + exception.getMessage());
-                    }
-                });
+                movingAvg.producer.sendOffsetsToTransaction(movingAvg.currentOffsets, groupId);
+                movingAvg.producer.commitTransaction();  
             }
         } catch (WakeupException e) {
             // ignore for shutdown
@@ -113,30 +117,22 @@ public class FancyMovingAvgConsumer {
     }
 
     private void configure(String servers, String groupId) {
-        kafkaProps.put("group.id",groupId);
-        kafkaProps.put("bootstrap.servers",servers);
-        kafkaProps.put("auto.offset.reset","earliest");         // when in doubt, read everything
-        kafkaProps.put("key.deserializer","org.apache.kafka.common.serialization.StringDeserializer");
-        kafkaProps.put("value.deserializer","org.apache.kafka.common.serialization.StringDeserializer");
-        kafkaProps.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false);
-        consumer = new KafkaConsumer<String, String>(kafkaProps);
+        consumerProps.put("group.id",groupId);
+        consumerProps.put("bootstrap.servers",servers);
+        consumerProps.put("auto.offset.reset","earliest");         // when in doubt, read everything
+        consumerProps.put("key.deserializer","org.apache.kafka.common.serialization.StringDeserializer");
+        consumerProps.put("value.deserializer","org.apache.kafka.common.serialization.StringDeserializer");
+        consumerProps.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false);
+        consumer = new KafkaConsumer<String, String>(consumerProps);
+
+        producerProps.put("bootstrap.servers", servers);
+        producerProps.put("transactional.id", "my-transactional-id");
+        producer = new KafkaProducer<String,String>(producerProps, new StringSerializer(), new StringSerializer());
+        producer.initTransactions();
     }
 
     private void subscribe(List<String> topics) {
-        consumer.subscribe(topics, new HandleRebalance());
-    }
-
-    private class HandleRebalance implements ConsumerRebalanceListener {
-
-        public void onPartitionsRevoked(Collection<TopicPartition> collection) {
-            // commit offsets, so we won't calculate avg of data we've already read
-            System.out.println("Lost partitions in rebalance. Committing current offsets:" + currentOffsets);
-            consumer.commitSync(currentOffsets);
-        }
-
-        public void onPartitionsAssigned(Collection<TopicPartition> collection) {
-            // nothing to do, since we have no state-store from which to recover previous buffers
-        }
+        consumer.subscribe(topics);
     }
 
 }
