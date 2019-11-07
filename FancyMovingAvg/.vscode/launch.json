@@ -1,0 +1,13 @@
+{
+    "configurations": [
+
+        {
+            "type": "java",
+            "name": "CodeLens (Launch) - FancyMovingAvgConsumer",
+            "request": "launch",
+            "mainClass": "com.shapira.examples.fancymovingavg.FancyMovingAvgConsumer",
+            "projectName": "FancyMovingAvg",
+            "args": "localhost:9092 group1 blah 5"
+        }
+    ]
+}
